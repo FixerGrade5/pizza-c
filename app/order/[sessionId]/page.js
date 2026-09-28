@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { supabase } from '@/lib/supabaseClient'; // เช็ก path ให้ตรงกับไฟล์ใน project คุณ
+import { supabase } from '@/lib/supabaseClient'; // ตรวจสอบ path ให้ตรงกับโครงสร้างโปรเจกต์ของคุณ
 
 export default function OrderPage({ params }) {
   const { sessionId } = params;
@@ -26,7 +26,7 @@ export default function OrderPage({ params }) {
           .from('sessions')
           .select('*')
           .eq('id', sessionId)
-          .single();
+          .maybeSingle();
 
         if (sessionErr) console.error('Error fetching session:', sessionErr);
         else setSession(sessionData);
@@ -127,30 +127,36 @@ export default function OrderPage({ params }) {
       const orderItemsPayload = [];
 
       for (const item of cartItems) {
-        // ดึงสต๊อกล่าสุด
+        // ดึงสต๊อกล่าสุดจาก Supabase (ใช้ maybeSingle และ log error เพื่อความแม่นยำ)
         const { data: currentItem, error: fetchErr } = await supabase
           .from('menu_items')
           .select('stock, price')
           .eq('id', item.id)
-          .single();
+          .maybeSingle();
 
-        if (fetchErr || !currentItem) {
-          throw new Error(`ไม่สามารถตรวจสอบสต๊อกของ ${item.name} ได้`);
+        if (fetchErr) {
+          console.error('Supabase Fetch Error Details:', fetchErr);
+          throw new Error(`เกิดข้อผิดพลาดจากฐานข้อมูล: ${fetchErr.message}`);
+        }
+
+        if (!currentItem) {
+          console.error(`ไม่พบเมนู ID: "${item.id}" (${item.name}) ในตาราง menu_items`);
+          throw new Error(`ไม่พบรายการสินค้า ${item.name} ในระบบ (ID: ${item.id})`);
         }
 
         const newStock = (currentItem.stock || 0) - item.quantity;
         if (newStock < 0) {
-          throw new Error(`สินค้า ${item.name} มีสต๊อกไม่พอ (เหลือ ${currentItem.stock} ชิ้น)`);
+          throw new Error(`สินค้า ${item.name} มีสต๊อกไม่พอ (เหลือ ${currentItem.stock || 0} ชิ้น)`);
         }
 
-        // ตัดสต๊อก
+        // ตัดสต๊อกใน Supabase
         const { error: updateErr } = await supabase
           .from('menu_items')
           .update({ stock: newStock })
           .eq('id', item.id);
 
         if (updateErr) {
-          throw new Error(`อัปเดตสต๊อก ${item.name} ไม่สำเร็จ`);
+          throw new Error(`อัปเดตสต๊อก ${item.name} ไม่สำเร็จ: ${updateErr.message}`);
         }
 
         const itemPrice = currentItem.price || 0;
@@ -237,7 +243,7 @@ export default function OrderPage({ params }) {
       {/* Header */}
       <div className="flex justify-between items-center mb-6 border-b pb-4">
         <h1 className="text-2xl font-bold text-gray-800">
-          ระบบสั่งอาหาร โต๊ะ {session?.table_number || '1'}[cite: 1]
+          ระบบสั่งอาหาร โต๊ะ {session?.table_number || '1'}
         </h1>
         {orderSuccess && (
           <div className="bg-green-100 border border-green-400 text-green-700 px-4 py-2 rounded">
@@ -352,7 +358,7 @@ export default function OrderPage({ params }) {
               disabled={submitting}
               className="px-6 py-3 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:opacity-50 transition"
             >
-              {submitting ? 'กำลังส่งรายการ...' : 'ยืนยันการสั่งซื้อ'}[cite: 1]
+              {submitting ? 'กำลังส่งรายการ...' : 'ยืนยันการสั่งซื้อ'}
             </button>
           </div>
         </div>
