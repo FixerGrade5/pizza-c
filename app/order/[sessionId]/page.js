@@ -115,24 +115,24 @@ export default function OrderPage({ params }) {
     });
   };
 
-  // ฟังก์ชันยืนยันการขาย / ตัดสต๊อก / ส่ง Telegram
-  const handleSubmitOrder = async () => {
-    const cartItems = Object.values(cart);
-    if (cartItems.length === 0 || !session) return;
-
-    setSubmitting(true);
-
-    try {
-      const currentTime = new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' });
-      const orderItemsPayload = [];
-
-      for (const item of cartItems) {
-        // ดึงสต๊อกล่าสุดจาก Supabase (ใช้ maybeSingle และ log error เพื่อความแม่นยำ)
-        const { data: currentItem, error: fetchErr } = await supabase
+for (const item of cartItems) {
+        // 1. ลองค้นหาด้วย ID ก่อน
+        let { data: currentItem, error: fetchErr } = await supabase
           .from('menu_items')
-          .select('stock, price')
+          .select('id, stock, price')
           .eq('id', item.id)
           .maybeSingle();
+
+        // 2. ถ้าหาด้วย ID ไม่เจอ ให้ fallback ไปหาด้วยชื่อสินค้า (name)
+        if (!currentItem) {
+          const { data: itemByName } = await supabase
+            .from('menu_items')
+            .select('id, stock, price')
+            .eq('name', item.name)
+            .maybeSingle();
+            
+          currentItem = itemByName;
+        }
 
         if (fetchErr) {
           console.error('Supabase Fetch Error Details:', fetchErr);
@@ -140,20 +140,22 @@ export default function OrderPage({ params }) {
         }
 
         if (!currentItem) {
-          console.error(`ไม่พบเมนู ID: "${item.id}" (${item.name}) ในตาราง menu_items`);
-          throw new Error(`ไม่พบรายการสินค้า ${item.name} ในระบบ (ID: ${item.id})`);
+          console.error(`ไม่พบเมนู: "${item.name}" (ID ที่ส่งมา: ${item.id}) ในตาราง menu_items`);
+          throw new Error(`ไม่พบรายการสินค้า ${item.name} ในระบบฐานข้อมูล`);
         }
 
+        const targetId = currentItem.id; // ใช้ ID ที่หาเจอจากฐานข้อมูลจริง
         const newStock = (currentItem.stock || 0) - item.quantity;
+
         if (newStock < 0) {
           throw new Error(`สินค้า ${item.name} มีสต๊อกไม่พอ (เหลือ ${currentItem.stock || 0} ชิ้น)`);
         }
 
-        // ตัดสต๊อกใน Supabase
+        // 3. ตัดสต๊อกใน Supabase โดยอ้างอิง targetId
         const { error: updateErr } = await supabase
           .from('menu_items')
           .update({ stock: newStock })
-          .eq('id', item.id);
+          .eq('id', targetId);
 
         if (updateErr) {
           throw new Error(`อัปเดตสต๊อก ${item.name} ไม่สำเร็จ: ${updateErr.message}`);
@@ -163,14 +165,14 @@ export default function OrderPage({ params }) {
         const totalPrice = itemPrice * item.quantity;
 
         orderItemsPayload.push({
-          menu_id: item.id,
+          menu_id: targetId,
           name: item.name,
           quantity: item.quantity,
           price: itemPrice,
           remaining_stock: newStock,
         });
 
-        // 1. ส่ง Telegram: รายการขายใหม่
+        // 4. ส่ง Telegram Notification
         const newOrderMsg = 
 `🛍️ <b>มีรายการขายใหม่! (โต๊ะ ${session.table_number || 1})</b>
 - สินค้า: ${item.name}
@@ -181,7 +183,6 @@ export default function OrderPage({ params }) {
 
         await sendTelegramNotification(newOrderMsg);
 
-        // 2. ส่ง Telegram: แจ้งเตือนสต๊อกเหลือน้อย (<= 5)
         if (newStock <= 5) {
           const lowStockMsg = 
 `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>
