@@ -1,332 +1,145 @@
 'use client';
 
-import { useState, useEffect, use } from 'react';
-import { supabase } from '@/lib/supabaseClient';
+import { useState } from 'react';
+import { supabase } from '@/lib/supabaseClient'; // ปรับ path ตามการใช้งานจริงของคุณ
 
 export default function OrderPage({ params }) {
-  // Unwrap params ที่เป็น Promise ตามหลักการ Next.js 15+ App Router
-  const resolvedParams = use(params);
-  const sessionId = resolvedParams.sessionId;
-
-  const [session, setSession] = useState(null);
-  const [categories, setCategories] = useState([]);
-  const [menuItems, setMenuItems] = useState([]);
-  const [selectedCategory, setSelectedCategory] = useState('all');
-  
-  // ตระกร้าสินค้า: Key เป็น menu_item_id ค่าเป็น object { item, quantity }
+  const { sessionId } = params;
   const [cart, setCart] = useState({});
-  const [loading, setLoading] = useState(true);
+  const [session, setSession] = useState({ id: sessionId, table_number: '1' });
   const [submitting, setSubmitting] = useState(false);
-  const [orderSuccess, setOrderSuccess] = useState(false);
 
-  // ดึงข้อมูล Session, หมวดหมู่ และ เมนูอาหาร
-  useEffect(() => {
-    async function fetchData() {
-      setLoading(true);
-
-      // 1. ดึงข้อมูล Session ปัจจุบัน
-      const { data: sessionData, error: sessionErr } = await supabase
-        .from('sessions')
-        .select('*')
-        .eq('id', sessionId)
-        .single();
-
-      if (sessionErr || !sessionData) {
-        console.error('Session not found:', sessionErr);
-      } else {
-        setSession(sessionData);
-      }
-
-      // 2. ดึงหมวดหมู่เมนู
-      const { data: catData } = await supabase
-        .from('menu_categories')
-        .select('*')
-        .order('sort_order', { ascending: true });
-
-      if (catData) setCategories(catData);
-
-      // 3. ดึงรายการเมนูอาหารทั้งหมด
-      const { data: menuData } = await supabase
-        .from('menu_items')
-        .select('*');
-
-      if (menuData) setMenuItems(menuData);
-
-      setLoading(false);
-    }
-
-    if (sessionId) {
-      fetchData();
-    }
-  }, [sessionId]);
-
-  // ฟังก์ชันเพิ่มจำนวนเมนูในตะกร้า
-  const addToCart = (item) => {
-    setCart((prev) => {
-      const currentQty = prev[item.id]?.quantity || 0;
-      return {
-        ...prev,
-        [item.id]: {
-          id: item.id,
-          name: item.name,
-          quantity: currentQty + 1,
+  // ฟังก์ชันยิงเข้า Route Handler
+  const sendTelegramNotification = async (messageText) => {
+    try {
+      const res = await fetch('/api/telegram', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-      };
-    });
+        body: JSON.stringify({ message: messageText }),
+      });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        console.warn('Telegram Route Error:', errorData);
+      }
+    } catch (err) {
+      // ไม่ให้ขัดจังหวะระบบขายหากการยิง notification ล้มเหลว
+      console.error('Failed to connect to /api/telegram:', err);
+    }
   };
 
-  // ฟังก์ชันลดจำนวนเมนูในตะกร้า
-  const removeFromCart = (itemId) => {
-    setCart((prev) => {
-      const currentQty = prev[itemId]?.quantity || 0;
-      if (currentQty <= 1) {
-        const newCart = { ...prev };
-        delete newCart[itemId];
-        return newCart;
-      }
-      return {
-        ...prev,
-        [itemId]: {
-          ...prev[itemId],
-          quantity: currentQty - 1,
-        },
-      };
-    });
-  };
-
-  // จำนวนรายการอาหารทั้งหมดในตะกร้า
-  const totalCartCount = Object.values(cart).reduce((sum, item) => sum + item.quantity, 0);
-
-  // ฟังก์ชันส่งออเดอร์เข้า Supabase
+  // ฟังก์ชันขาย/ตัดสต๊อก
   const handleSubmitOrder = async () => {
-    if (totalCartCount === 0 || !session) return;
+    const cartItems = Object.values(cart);
+    if (cartItems.length === 0) return;
 
     setSubmitting(true);
 
-    const orderItemsPayload = Object.values(cart).map((item) => ({
-      menu_id: item.id,
-      name: item.name,
-      quantity: item.quantity,
-    }));
+    try {
+      const currentTime = new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' });
+      const orderItemsPayload = [];
 
-    const { error } = await supabase.from('orders').insert([
-      {
-        session_id: session.id,
-        table_number: session.table_number,
-        items: orderItemsPayload, // บันทึกแบบ JSONB
-        status: 'pending',
-      },
-    ]);
+      for (const item of cartItems) {
+        // 1. ดึงสต๊อกปัจจุบัน
+        const { data: currentItem, error: fetchErr } = await supabase
+          .from('menu_items')
+          .select('stock, price')
+          .eq('id', item.id)
+          .single();
 
-    setSubmitting(false);
+        if (fetchErr || !currentItem) {
+          throw new Error(`ไม่สามารถดึงข้อมูลสต๊อกของ ${item.name} ได้`);
+        }
 
-    if (error) {
-      alert(`ไม่สามารถส่งออเดอร์ได้: ${error.message}`);
-    } else {
-      setOrderSuccess(true);
+        const newStock = (currentItem.stock || 0) - item.quantity;
+        if (newStock < 0) {
+          throw new Error(`สินค้า ${item.name} มีจำนวนไม่พอ (คงเหลือ ${currentItem.stock || 0} ชิ้น)`);
+        }
+
+        // 2. ตัดสต๊อกใน Supabase
+        const { error: updateErr } = await supabase
+          .from('menu_items')
+          .update({ stock: newStock })
+          .eq('id', item.id);
+
+        if (updateErr) {
+          throw new Error(`อัปเดตสต๊อก ${item.name} ไม่สำเร็จ: ${updateErr.message}`);
+        }
+
+        const itemPrice = currentItem.price || 0;
+        const totalPrice = itemPrice * item.quantity;
+
+        orderItemsPayload.push({
+          menu_id: item.id,
+          name: item.name,
+          quantity: item.quantity,
+          price: itemPrice,
+          remaining_stock: newStock,
+        });
+
+        // -------------------------------------------------------------
+        // งานที่ 1: แจ้งเตือน Order เข้า (New Order Alert)
+        // -------------------------------------------------------------
+        const newOrderMessage = 
+`🛍️ <b>มีรายการขายใหม่! (โต๊ะ ${session.table_number})</b>
+- สินค้า: ${item.name}
+- จำนวน: ${item.quantity} ชิ้น
+- ราคารวม: ${totalPrice.toLocaleString()} บาท
+- สต๊อกคงเหลือปัจจุบัน: ${newStock} ชิ้น
+- เวลา: ${currentTime}`;
+
+        await sendTelegramNotification(newOrderMessage);
+
+        // -------------------------------------------------------------
+        // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert <= 5)
+        // -------------------------------------------------------------
+        if (newStock <= 5) {
+          const lowStockMessage = 
+`🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>
+- สินค้า: ${item.name}
+- คงเหลือเพียง: ${newStock} ชิ้น
+⚠️ กรุณาเติมสต๊อกสินค้าด่วน!`;
+
+          await sendTelegramNotification(lowStockMessage);
+        }
+      }
+
+      // 3. บันทึกออเดอร์
+      const { error: orderErr } = await supabase.from('orders').insert([
+        {
+          session_id: session.id,
+          table_number: session.table_number,
+          items: orderItemsPayload,
+          status: 'pending',
+        },
+      ]);
+
+      if (orderErr) {
+        throw new Error(`บันทึกออเดอร์ไม่สำเร็จ: ${orderErr.message}`);
+      }
+
+      alert('ทำรายการสั่งซื้อเรียบร้อยแล้ว!');
       setCart({});
-      setTimeout(() => setOrderSuccess(false), 4000); // ซ่อนข้อความแจ้งเตือนหลัง 4 วินาที
+
+    } catch (err) {
+      alert(`เกิดข้อผิดพลาด: ${err.message}`);
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  // กรองเมนูอาหารตามหมวดหมู่ที่เลือก
-  const filteredMenuItems = selectedCategory === 'all'
-    ? menuItems
-    : menuItems.filter((item) => item.category_id === Number(selectedCategory));
-
-  if (loading) {
-    return <div style={{ padding: '2rem', textAlign: 'center', fontFamily: 'sans-serif' }}>กำลังโหลดเมนู...</div>;
-  }
-
-  if (!session) {
-    return (
-      <div style={{ padding: '2rem', textAlign: 'center', color: 'red', fontFamily: 'sans-serif' }}>
-        <h2>ไม่พบข้อมูลโต๊ะหรือ Session นี้เปิดอยู่อีกต่อไป</h2>
-        <p>กรุณาสแกน QR Code ใหม่อีกครั้ง</p>
-      </div>
-    );
-  }
-
   return (
-    <div style={{ fontFamily: 'sans-serif', paddingBottom: '100px', maxWidth: '600px', margin: '0 auto', background: '#f8f9fa', minHeight: '100vh' }}>
-      
-      {/* Header แสดงข้อมูลโต๊ะ */}
-      <header style={{ background: '#d32f2f', color: '#fff', padding: '1rem', position: 'sticky', top: 0, zIndex: 10, boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>
-        <h1 style={{ margin: 0, fontSize: '1.4rem' }}>Pizza Companies</h1>
-        <p style={{ margin: '0.25rem 0 0 0', fontSize: '0.9rem', opacity: 0.9 }}>
-          โต๊ะ: <strong>{session.table_number}</strong> | ผู้ใหญ่ {session.adult_count} คน, เด็ก {session.child_count} คน
-        </p>
-      </header>
-
-      {/* แจ้งเตือนเมื่อส่งออเดอร์สำเร็จ */}
-      {orderSuccess && (
-        <div style={{ background: '#4caf50', color: '#fff', padding: '0.75rem', textAlign: 'center', fontWeight: 'bold' }}>
-          ส่งรายการสั่งอาหารเข้าห้องครัวเรียบร้อยแล้ว!
-        </div>
-      )}
-
-      {/* แถบเลือกหมวดหมู่เมนู */}
-      <div style={{ display: 'flex', overflowX: 'auto', padding: '0.75rem', gap: '0.5rem', background: '#fff', borderBottom: '1px solid #e0e0e0' }}>
-        <button
-          onClick={() => setSelectedCategory('all')}
-          style={{
-            padding: '0.5rem 1rem',
-            borderRadius: '20px',
-            border: 'none',
-            whiteSpace: 'nowrap',
-            background: selectedCategory === 'all' ? '#d32f2f' : '#e0e0e0',
-            color: selectedCategory === 'all' ? '#fff' : '#333',
-            cursor: 'pointer',
-            fontWeight: 'bold',
-          }}
-        >
-          ทั้งหมด
-        </button>
-        {categories.map((cat) => (
-          <button
-            key={cat.id}
-            onClick={() => setSelectedCategory(cat.id)}
-            style={{
-              padding: '0.5rem 1rem',
-              borderRadius: '20px',
-              border: 'none',
-              whiteSpace: 'nowrap',
-              background: selectedCategory === cat.id ? '#d32f2f' : '#e0e0e0',
-              color: selectedCategory === cat.id ? '#fff' : '#333',
-              cursor: 'pointer',
-              fontWeight: 'bold',
-            }}
-          >
-            {cat.name}
-          </button>
-        ))}
-      </div>
-
-      {/* รายการเมนูอาหาร */}
-      <div style={{ padding: '1rem' }}>
-        <div style={{ display: 'grid', gap: '0.75rem' }}>
-          {filteredMenuItems.map((item) => {
-            const qtyInCart = cart[item.id]?.quantity || 0;
-
-            return (
-              <div
-                key={item.id}
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  background: '#fff',
-                  padding: '1rem',
-                  borderRadius: '8px',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
-                }}
-              >
-                <div style={{ fontWeight: '500', fontSize: '1rem' }}>{item.name}</div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  {qtyInCart > 0 ? (
-                    <>
-                      <button
-                        onClick={() => removeFromCart(item.id)}
-                        style={{
-                          width: '32px',
-                          height: '32px',
-                          borderRadius: '50%',
-                          border: '1px solid #d32f2f',
-                          background: '#fff',
-                          color: '#d32f2f',
-                          fontSize: '1.2rem',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        -
-                      </button>
-                      <span style={{ fontWeight: 'bold', minWidth: '20px', textAlign: 'center' }}>{qtyInCart}</span>
-                      <button
-                        onClick={() => addToCart(item)}
-                        style={{
-                          width: '32px',
-                          height: '32px',
-                          borderRadius: '50%',
-                          border: 'none',
-                          background: '#d32f2f',
-                          color: '#fff',
-                          fontSize: '1.2rem',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        +
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      onClick={() => addToCart(item)}
-                      style={{
-                        padding: '0.4rem 0.8rem',
-                        borderRadius: '6px',
-                        border: 'none',
-                        background: '#d32f2f',
-                        color: '#fff',
-                        fontWeight: 'bold',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      เลือก
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          {filteredMenuItems.length === 0 && (
-            <p style={{ textAlign: 'center', color: '#999', marginTop: '2rem' }}>ไม่มีรายการอาหารในหมวดหมู่นี้</p>
-          )}
-        </div>
-      </div>
-
-      {/* แถบด้านล่างสำหรับส่งออเดอร์ (แสดงเมื่อมีของในตะกร้า) */}
-      {totalCartCount > 0 && (
-        <div
-          style={{
-            position: 'fixed',
-            bottom: 0,
-            left: 0,
-            right: 0,
-            background: '#fff',
-            padding: '1rem',
-            boxShadow: '0 -2px 10px rgba(0,0,0,0.1)',
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            maxWidth: '600px',
-            margin: '0 auto',
-            zIndex: 100,
-          }}
-        >
-          <div>
-            <span style={{ fontSize: '0.9rem', color: '#666' }}>รายการที่เลือกทั้งหมด:</span>
-            <div style={{ fontSize: '1.1rem', fontWeight: 'bold', color: '#d32f2f' }}>{totalCartCount} รายการ</div>
-          </div>
-
-          <button
-            onClick={handleSubmitOrder}
-            disabled={submitting}
-            style={{
-              padding: '0.75rem 1.5rem',
-              background: '#28a745',
-              color: '#fff',
-              border: 'none',
-              borderRadius: '6px',
-              fontSize: '1rem',
-              fontWeight: 'bold',
-              cursor: submitting ? 'not-allowed' : 'pointer',
-            }}
-          >
-            {submitting ? 'กำลังส่ง...' : 'ยืนยันสั่งอาหาร'}
-          </button>
-        </div>
-      )}
+    <div className="p-6">
+      <h1 className="text-xl font-bold mb-4">ระบบสั่งอาหาร โต๊ะ {session.table_number}</h1>
+      <button
+        onClick={handleSubmitOrder}
+        disabled={submitting}
+        className="px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 disabled:opacity-50"
+      >
+        {submitting ? 'กำลังดำเนินการ...' : 'ยืนยันการสั่งซื้อ'}
+      </button>
     </div>
   );
 }
